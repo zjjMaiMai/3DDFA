@@ -24,18 +24,35 @@ from utils.cv_plot import plot_pose_box
 from utils.estimate_pose import parse_pose
 from utils.render import get_depths_image, cget_depths_image, cpncc
 from utils.paf import gen_img_paf
+from utils.lighting import RenderPipeline
 import argparse
 import torch.backends.cudnn as cudnn
 
 STD_SIZE = 120
 draw_shiftbits = 4
 draw_multiplier = 1 << 4
+cfg = {
+    'intensity_ambient': 0.3,
+    'color_ambient': (1, 1, 1),
+    'intensity_directional': 0.6,
+    'color_directional': (1, 1, 1),
+    'intensity_specular': 0.1,
+    'specular_exp': 5,
+    'light_pos': (0, 0, 5),
+    'view_pos': (0, 0, 5)
+}
 
+def _to_ctype(arr):
+    if not arr.flags.c_contiguous:
+        return arr.copy(order='C')
+    return arr
 
 def main(args):
     # 1. load pre-tained model
     checkpoint_fp = 'models/phase1_wpdc_vdc.pth.tar'
     arch = 'mobilenet_1'
+
+    app = RenderPipeline(**cfg)
 
     checkpoint = torch.load(checkpoint_fp, map_location=lambda storage, loc: storage)['state_dict']
     model = getattr(mobilenet_v1, arch)(num_classes=62)  # 62 = 12(pose) + 40(shape) +10(expression)
@@ -53,12 +70,13 @@ def main(args):
     face_detector = dlib.get_frontal_face_detector()
 
     # 3. forward
-    tri = sio.loadmat('visualize/tri.mat')['tri']
+    tri = sio.loadmat('tri_refine.mat')['tri']
+    tri = _to_ctype(tri).astype(np.int32)  # for type compatible
     transform = transforms.Compose([ToTensorGjz(), NormalizeGjz(mean=127.5, std=128)])
 
     last_frame_lmks = []
 
-    vc = cv2.VideoCapture(0)
+    vc = cv2.VideoCapture("C:\\Users\\zh13\\Videos\\TrackingTest.mov")
     success, frame = vc.read()
     while success:
         roi_box = []
@@ -73,6 +91,7 @@ def main(args):
                 roi_box.append(parse_roi_box_from_landmark(lmk))
         
         this_frame_lmk = []
+        params = []
         for box in roi_box:
             img_to_net = crop_img(frame, box)
             img_to_net = cv2.resize(img_to_net, dsize=(STD_SIZE, STD_SIZE), interpolation=cv2.INTER_LINEAR)
@@ -82,13 +101,18 @@ def main(args):
                     input = input.cuda()
                 param = model(input)
                 param = param.squeeze().cpu().numpy().flatten().astype(np.float32)
+                params.append(param)
             this_frame_lmk.append(predict_68pts(param, box))
-
         last_frame_lmks = this_frame_lmk
         
-        for lmk in last_frame_lmks:
-            for p in lmk.T:
-                cv2.circle(frame, (int(round(p[0] * draw_multiplier)), int(round(p[1] * draw_multiplier))), draw_multiplier, (255,0,0), 1, cv2.LINE_AA, draw_shiftbits)
+        if args.render_mesh:
+            for box, param in zip(roi_box, params):
+                vertices = predict_dense(param, box)
+                frame = app(_to_ctype(vertices.T), tri, _to_ctype(frame.astype(np.float32) / 255.))
+        else:
+            for lmk in last_frame_lmks:
+                for p in lmk.T:
+                    cv2.circle(frame, (int(round(p[0] * draw_multiplier)), int(round(p[1] * draw_multiplier))), draw_multiplier, (255,0,0), 1, cv2.LINE_AA, draw_shiftbits)
         cv2.imshow("3ddfa video demo", frame)
         cv2.waitKey(1)
         success, frame = vc.read()
@@ -98,6 +122,7 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='3DDFA inference pipeline')
     parser.add_argument('-m', '--mode', default='cpu', type=str, help='gpu or cpu mode')
-
+    parser.add_argument('--render_mesh', default='true', type=str2bool)
+    
     args = parser.parse_args()
     main(args)
